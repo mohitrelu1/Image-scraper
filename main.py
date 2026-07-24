@@ -186,15 +186,25 @@ _KNOWN_TYPE_FOLDERS = {
     "Extra Image": "extra_photos/extra_",
 }
 
+# Image types the output should actually include. "Extra Image" thumbnails
+# (additional angles/lifestyle shots) are recognized — we know how to build
+# their URL — but deliberately left out here. To bring them back later
+# (e.g. the client wants full image coverage), just add "Extra Image" to
+# this set; no other code changes needed.
+INCLUDED_TYPES = {"primary", "Packaging Image"}
+
 
 def _folder_for_type(img_type):
     """
-    Return the folder prefix for a known image type, or None for an
-    unrecognized one. Returning None (instead of guessing "extra") means
-    an unfamiliar type — e.g. a future "Gallery Image" or "360 Image" —
-    gets logged and skipped by the caller rather than silently mapped to
-    the wrong folder.
+    Return the folder prefix for a known, wanted image type (one that's
+    both in _KNOWN_TYPE_FOLDERS and in INCLUDED_TYPES). Returns None
+    otherwise — the caller distinguishes "recognized but not wanted"
+    (skip quietly) from "genuinely unrecognized" (log a warning, since a
+    future type like "Gallery Image" shouldn't map to the wrong folder
+    silently).
     """
+    if img_type not in INCLUDED_TYPES:
+        return None
     return _KNOWN_TYPE_FOLDERS.get(img_type)
 
 
@@ -239,7 +249,8 @@ def parse_image_urls(soup):
 
         image_url = _large_url_for(filename, img_type)
         if image_url is None:
-            utils_logger.warning("Unknown image type %r for %r, skipping", img_type, filename)
+            if img_type not in _KNOWN_TYPE_FOLDERS:
+                utils_logger.warning("Unknown image type %r for %r, skipping", img_type, filename)
             continue
 
         urls.append(image_url)
@@ -289,11 +300,6 @@ RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}  # transient — worth retryi
 # the chance of tripping rate limiting in the first place.
 REQUEST_DELAY_SECONDS = 0.2
 
-# GET-check (stream=True, body never read) every constructed image URL
-# before trusting it, so a folder-naming change on the site shows up as a
-# logged warning instead of a silently broken link in the output. GET is
-# used instead of HEAD because some CDN configs don't support HEAD
-# reliably, while GET is universally supported.
 # GET-check (stream=True, body never read) every constructed image URL
 # before trusting it, so a folder-naming change on the site shows up as a
 # logged warning instead of a silently broken link in the output. GET is
