@@ -1,0 +1,17 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Output files
+output/
+*.log
+
+# Local data
+data/
+
+# macOS / Windows
+.DS_Store
+Thumbs.db

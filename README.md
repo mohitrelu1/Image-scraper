@@ -1,7 +1,7 @@
 # Ariel Premium — Image Scraper
 
 Scrapes the highest-resolution image URL for every product listed in
-`data/data.csv` and writes a clean `sku, url, image_url` CSV — one row per
+`data/data.csv` and writes a clean `url, sku, image_url` CSV — one row per
 image, nothing else.
 
 ## Setup
@@ -24,7 +24,7 @@ python main.py --test 20 --validate   # flags combine freely
 
 - Input:  `data/data.csv` — accepts either `sku`/`url` or `manu_sku`/`prod_page_url`
   headers (the real file uses the latter).
-- Output: `output/images.csv` — columns: `sku, url, image_url`
+- Output: `output/images.csv` — columns: `url, sku, image_url`
 - Log:    `output/scraper.log` — rotating file log (5MB x 3 backups), plus
   the same messages print to the console live.
 
@@ -80,12 +80,14 @@ and rebuilds the URL the same way, instead of clicking every thumbnail.
   regardless of outcome, so a run of thousands of pages doesn't hammer the
   site back-to-back and is less likely to trigger rate limiting at all.
 - 404 responses are not retried — logged and skipped immediately.
-- 401/403 responses, and 200 responses whose body looks like a
-  CAPTCHA/challenge page (Cloudflare interstitial, "verify you're human",
-  etc.), are logged as `Possible bot protection encountered` instead of a
-  generic failure — useful if the site ever starts blocking the scraper
-  instead of serving real pages, so it doesn't just look like "0 images
-  found" in the output.
+- 401/403 responses, and 200 responses where **no product thumbnails were
+  found at all** and the body looks like a CAPTCHA/challenge page
+  (Cloudflare interstitial, "verify you're human", etc.), are logged as
+  `Possible bot protection encountered` instead of a generic failure —
+  useful if the site ever starts blocking the scraper instead of serving
+  real pages. This check only runs when zero images were extracted, so a
+  normal product page that happens to embed an unrelated CAPTCHA widget
+  (e.g. on a contact form elsewhere on the page) is never flagged.
 - One product failing (bad HTML, network error, no images found) never
   stops the run; it's logged and the scraper moves to the next row.
 - Rows in `data.csv` missing a sku or url are skipped with a warning
@@ -105,4 +107,25 @@ few directly in your browser — you should land on the full-size image
 `output/scraper.log` for any `WARNING` lines about unknown image types or
 failed validation — those flag anything the script couldn't confidently
 resolve.
-"# Image-scraper" 
+
+### Checking a single product
+
+To spot-check one SKU without running the whole batch, use
+`verify_product.py` — it reuses the exact same scraper as `main.py`, so
+there's no risk of a hand-typed one-off snippet drifting from the real
+logic (and no PowerShell/cmd quoting headaches):
+
+```bash
+python verify_product.py https://www.arielpremium.com/product/ALB-EF25
+python verify_product.py https://www.arielpremium.com/product/ALB-EF25 --validate
+```
+
+It prints every unique image URL found for that product plus a total
+count.
+
+**Windows note:** paste multi-line Python (like the interactive-mode
+block below) into an actual `python` REPL or a `.py` file — never into
+`cmd.exe` or PowerShell directly. Neither shell understands Python's
+indented blocks, so each line after the first gets parsed as a shell
+command instead and fails with errors like `'oc' is not recognized...`.
+`verify_product.py` avoids this entirely since it's a real script file.

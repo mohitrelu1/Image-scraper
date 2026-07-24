@@ -147,7 +147,7 @@ def get_logger(name: str) -> logging.Logger:
 # whole carousel in the DOM — are removed.
 # ==========================================================================
 
-OUTPUT_COLUMNS = ["sku", "url", "image_url"]
+OUTPUT_COLUMNS = ["url", "sku", "image_url"]
 
 CLOUDFRONT_BASE = "https://d2b9vjwb3yw5iu.cloudfront.net/"
 
@@ -368,13 +368,6 @@ class ProductScraper:
                     continue
 
                 response.raise_for_status()
-
-                if _looks_like_bot_protection(response.text):
-                    scraper_logger.warning(
-                        "Possible bot protection encountered (200 response looks like a "
-                        "CAPTCHA/challenge page, not a product page) for %s", url,
-                    )
-
                 return response.text
 
             except requests.exceptions.Timeout:
@@ -427,11 +420,18 @@ class ProductScraper:
         except requests.exceptions.RequestException as exc:
             return False, str(exc)
 
-    def extract_images(self, soup, sku, url):
+    def extract_images(self, soup, html, sku, url):
         """Return every valid high-res image URL on the page. Never raises."""
         candidate_urls = parse_image_urls(soup)
         if not candidate_urls:
-            scraper_logger.warning("No image thumbnails found for sku=%s url=%s", sku, url)
+            if _looks_like_bot_protection(html):
+                scraper_logger.warning(
+                    "Possible bot protection encountered (no product thumbnails found, "
+                    "and the page body matches a CAPTCHA/challenge pattern) | sku=%s | url=%s",
+                    sku, url,
+                )
+            else:
+                scraper_logger.warning("No image thumbnails found for sku=%s url=%s", sku, url)
             return []
 
         if not self.validate:
@@ -462,7 +462,7 @@ class ProductScraper:
         if soup is None:
             return {"sku": sku, "url": url, "images": []}
 
-        return {"sku": sku, "url": url, "images": self.extract_images(soup, sku, url)}
+        return {"sku": sku, "url": url, "images": self.extract_images(soup, html, sku, url)}
 
 
 # ==========================================================================
