@@ -88,6 +88,10 @@ and rebuilds the URL the same way, instead of clicking every thumbnail.
   real pages. This check only runs when zero images were extracted, so a
   normal product page that happens to embed an unrelated CAPTCHA widget
   (e.g. on a contact form elsewhere on the page) is never flagged.
+- Duplicate rows in `data.csv` (same product url appearing more than once)
+  are collapsed to one before scraping starts — the run logs how many
+  were removed. Dedup is by `url`, since that's what's actually fetched;
+  scraping the same page twice only produces duplicate rows in the output.
 - One product failing (bad HTML, network error, no images found) never
   stops the run; it's logged and the scraper moves to the next row.
 - Rows in `data.csv` missing a sku or url are skipped with a warning

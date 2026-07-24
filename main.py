@@ -512,6 +512,29 @@ def read_input_rows(path):
             yield {"sku": sku, "url": url}
 
 
+def dedupe_input_rows(input_rows):
+    """
+    Drop rows whose url has already been seen, keeping the first
+    occurrence and preserving order. Dedup by url (not sku) because url
+    is what actually gets fetched — if two rows point to the same page,
+    scraping it twice only produces duplicate output rows.
+    """
+    seen_urls = set()
+    unique_rows = []
+
+    for row in input_rows:
+        if row["url"] in seen_urls:
+            continue
+        seen_urls.add(row["url"])
+        unique_rows.append(row)
+
+    removed = len(input_rows) - len(unique_rows)
+    if removed:
+        logger.info("Removed %d duplicate input row(s) (same url seen more than once)", removed)
+
+    return unique_rows
+
+
 def generate_image_rows(scraper, input_rows):
     """Scrape every input row and yield one output dict per image found."""
     products_with_images = 0
@@ -571,6 +594,8 @@ def main():
     if not input_rows:
         logger.error("No valid input rows found in %s; nothing to scrape.", INPUT_PATH)
         return 1
+
+    input_rows = dedupe_input_rows(input_rows)
 
     if args.test is not None:
         logger.info("--test %d given: limiting run to the first %d of %d rows", args.test, args.test, len(input_rows))
