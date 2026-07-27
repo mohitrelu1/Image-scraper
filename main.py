@@ -12,6 +12,8 @@ Run it with:
     python main.py --test 20   # only the first 20 valid input rows
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import logging
@@ -20,9 +22,139 @@ import sys
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Iterable, Iterator, Optional
 
 import requests
 from bs4 import BeautifulSoup
+
+__version__ = "1.0.0"
+
+# ==========================================================================
+# Configuration
+#
+# Every tunable value the script uses lives here, in one place, instead of
+# being scattered next to whichever function happens to use it. Grouped by
+# the area of the script they configure.
+# ==========================================================================
+
+# --- Paths -----------------------------------------------------------------
+INPUT_PATH = Path("data") / "data.csv"
+OUTPUT_PATH = Path("output") / "images.csv"
+LOG_FILE = Path("output") / "scraper.log"
+
+# --- Logging -----------------------------------------------------------------
+LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# 5 MB per file, keep 3 backups (scraper.log.1, .2, .3) before overwriting
+# the oldest. Prevents unbounded growth on large runs (e.g. thousands of
+# products) while still keeping recent history on disk.
+LOG_MAX_BYTES = 5_000_000
+LOG_BACKUP_COUNT = 3
+
+# All loggers hang off this single package-level logger, e.g.
+# "image_scraper.scraper", "image_scraper.main". Handlers are attached HERE
+# ONLY (not to the true Python root logger). Child loggers use their
+# default propagate=True, so records flow up to this logger and hit its
+# handlers exactly once. This logger itself has propagate=False, so those
+# records stop here and never continue up to the real root logger — that
+# insulates us from duplicate output if this script is ever imported into
+# a larger app (Django, Flask, etc.) that configures the real root logger
+# with its own handlers.
+PACKAGE_LOGGER_NAME = "image_scraper"
+
+# --- Input / output CSV columns --------------------------------------------
+OUTPUT_COLUMNS = ["url", "sku", "image_url"]
+
+# The real data.csv uses different header names than a generic spec might,
+# so both are accepted here instead of hard-failing on a header mismatch.
+SKU_COLUMN_CANDIDATES = ("sku", "manu_sku")
+URL_COLUMN_CANDIDATES = ("url", "prod_page_url")
+
+# --- Image-type -> folder mapping -------------------------------------------
+# Each thumbnail on a product page looks like:
+#
+#     <img class="smallimage"
+#          onclick="swapImage('wcp-fs23_extra08.jpg','Extra Image', this)">
+#
+# The onclick already tells us the filename + image type. The page's own
+# swapImage() JS builds the large-image URL like this:
+#
+#     type == 'Packaging Image' -> folder = 'package_photos/package_'
+#     type == 'primary'         -> folder = ''
+#     type == 'Extra Image'     -> folder = 'extra_photos/extra_'
+#
+#     large_url = CLOUDFRONT_BASE + 'files/Primary/' + folder + 'large/' + filename
+#
+# We read the onclick attributes straight out of the static HTML (no
+# browser needed — these attributes are already present in the page
+# source) and rebuild the URL ourselves, mirroring swapImage() exactly.
+CLOUDFRONT_BASE = "https://d2b9vjwb3yw5iu.cloudfront.net/"
+
+IMAGE_TYPE_PRIMARY = "primary"
+IMAGE_TYPE_EXTRA = "Extra Image"
+IMAGE_TYPE_PACKAGING = "Packaging Image"
+
+# The type mapping is intentionally explicit rather than "anything unknown
+# defaults to Extra" — a future type the site introduces (e.g. "Gallery
+# Image") gets logged and skipped instead of silently mapped to the wrong
+# folder. Thumbnails with no onclick (padding placeholders, video-play
+# icons) are skipped, and duplicate filenames — the page duplicates the
+# whole carousel in the DOM — are removed.
+KNOWN_TYPE_FOLDERS = {
+    IMAGE_TYPE_PACKAGING: "package_photos/package_",
+    IMAGE_TYPE_PRIMARY: "",
+    IMAGE_TYPE_EXTRA: "extra_photos/extra_",
+}
+
+# matches: swapImage('filename.jpg','Type', this)  (single/double quotes, spacing varies)
+SWAPIMAGE_RE = re.compile(
+    r"""swapImage\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]"""
+)
+
+# Short, well-known phrases used by CAPTCHA/challenge pages (Cloudflare,
+# reCAPTCHA, hCaptcha, generic "verify you're human" interstitials). This
+# is a heuristic, not a guarantee — it exists only to turn a silent
+# "0 images found" into an actionable log line when the site starts
+# blocking the scraper instead of serving real product pages.
+BOT_PROTECTION_MARKERS = (
+    "captcha",
+    "checking your browser",
+    "verify you are human",
+    "verify you're human",
+    "attention required! | cloudflare",
+    "access denied",
+)
+
+# --- HTTP / scraping behavior ------------------------------------------------
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+REQUEST_TIMEOUT_SECONDS = 15
+MAX_RETRIES = 3
+INITIAL_BACKOFF_SECONDS = 2.0  # doubles each retry: 2s, 4s, 8s
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}  # transient — worth retrying; 404/403 are not
+
+# Pause between products so a run of thousands of pages doesn't hammer the
+# site back-to-back. Modest cost on total runtime, meaningfully reduces
+# the chance of tripping rate limiting in the first place.
+REQUEST_DELAY_SECONDS = 0.2
+
+# GET-check (stream=True, body never read) every constructed image URL
+# before trusting it, so a folder-naming change on the site shows up as a
+# logged warning instead of a silently broken link in the output. GET is
+# used instead of HEAD because some CDN configs don't support HEAD
+# reliably, while GET is universally supported.
+#
+# Off by default: for a full run (thousands of products x ~8 images each)
+# this is tens of thousands of extra HTTP requests, which meaningfully
+# slows the run down. Turn it on with --validate when you want the safety
+# check — e.g. after the site changes something, or for a first run
+# against a catalog you haven't scraped before.
+DEFAULT_VALIDATE_IMAGES = False
+VALIDATE_TIMEOUT_SECONDS = 10
+
 
 # ==========================================================================
 # Logging setup
@@ -34,27 +166,6 @@ from bs4 import BeautifulSoup
 # without repeating configuration in multiple places.
 # ==========================================================================
 
-LOG_FILE = Path("output") / "scraper.log"
-LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
-
-# 5 MB per file, keep 3 backups (scraper.log.1, .2, .3) before overwriting
-# the oldest. Prevents unbounded growth on large runs (e.g. thousands of
-# products) while still keeping recent history on disk.
-MAX_BYTES = 5_000_000
-BACKUP_COUNT = 3
-
-# All loggers hang off this single package-level logger, e.g.
-# "image_scraper.scraper", "image_scraper.main". Handlers are attached HERE
-# ONLY (not to the true Python root logger). Child loggers use their
-# default propagate=True, so records flow up to this logger and hit its
-# handlers exactly once. This logger itself has propagate=False, so those
-# records stop here and never continue up to the real root logger — that
-# insulates us from duplicate output if this script is ever imported into
-# a larger app (Django, Flask, etc.) that configures the real root logger
-# with its own handlers.
-_PACKAGE_LOGGER_NAME = "image_scraper"
-
 _configured = False
 
 
@@ -63,7 +174,7 @@ def _configure_package_logger() -> None:
     Set up the package-level logger once with two handlers:
       - StreamHandler        -> stdout, for live progress while the scraper runs.
       - RotatingFileHandler  -> output/scraper.log, for a persistent audit trail
-        that rotates once it hits MAX_BYTES instead of growing forever.
+        that rotates once it hits LOG_MAX_BYTES instead of growing forever.
 
     Guarded by a module-level flag so repeated calls to get_logger()
     don't attach duplicate handlers, which would otherwise cause every
@@ -75,7 +186,7 @@ def _configure_package_logger() -> None:
 
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-    package_logger = logging.getLogger(_PACKAGE_LOGGER_NAME)
+    package_logger = logging.getLogger(PACKAGE_LOGGER_NAME)
     package_logger.setLevel(logging.INFO)
     package_logger.propagate = False
 
@@ -87,8 +198,8 @@ def _configure_package_logger() -> None:
 
     file_handler = RotatingFileHandler(
         LOG_FILE,
-        maxBytes=MAX_BYTES,
-        backupCount=BACKUP_COUNT,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
         encoding="utf-8",
     )
     file_handler.setFormatter(formatter)
@@ -114,104 +225,91 @@ def get_logger(name: str) -> logging.Logger:
     handlers — it must NOT be set to False here, or records would have
     nowhere to go, since handlers live on the package logger, not on each
     child.
+
+    Args:
+        name: short, module-scoped suffix (e.g. "scraper", "utils", "main").
+
+    Returns:
+        A logging.Logger namespaced under "image_scraper.<name>".
     """
     _configure_package_logger()
-    return logging.getLogger(f"{_PACKAGE_LOGGER_NAME}.{name}")
+    return logging.getLogger(f"{PACKAGE_LOGGER_NAME}.{name}")
+
+
+utils_logger = get_logger("utils")
+scraper_logger = get_logger("scraper")
+logger = get_logger("main")
 
 
 # ==========================================================================
 # Image-URL parsing utilities
-#
-# Each thumbnail on a product page looks like:
-#
-#     <img class="smallimage"
-#          onclick="swapImage('wcp-fs23_extra08.jpg','Extra Image', this)">
-#
-# The onclick already tells us the filename + image type. The page's own
-# swapImage() JS builds the large-image URL like this:
-#
-#     type == 'Packaging Image' -> folder = 'package_photos/package_'
-#     type == 'primary'         -> folder = ''
-#     type == 'Extra Image'     -> folder = 'extra_photos/extra_'
-#
-#     large_url = CLOUDFRONT_BASE + 'files/Primary/' + folder + 'large/' + filename
-#
-# We read the onclick attributes straight out of the static HTML (no
-# browser needed — these attributes are already present in the page
-# source) and rebuild the URL ourselves, mirroring swapImage() exactly.
-# The type mapping is intentionally explicit rather than "anything unknown
-# defaults to Extra" — a future type the site introduces (e.g. "Gallery
-# Image") gets logged and skipped instead of silently mapped to the wrong
-# folder. Thumbnails with no onclick (padding placeholders, video-play
-# icons) are skipped, and duplicate filenames — the page duplicates the
-# whole carousel in the DOM — are removed.
 # ==========================================================================
 
-OUTPUT_COLUMNS = ["url", "sku", "image_url"]
+def _looks_like_bot_protection(html: Optional[str]) -> bool:
+    """
+    Return True if html appears to be a CAPTCHA/challenge page rather than
+    a real product page, based on BOT_PROTECTION_MARKERS. Heuristic only.
 
-CLOUDFRONT_BASE = "https://d2b9vjwb3yw5iu.cloudfront.net/"
+    Args:
+        html: raw page HTML, or None.
 
-# matches: swapImage('filename.jpg','Type', this)  (single/double quotes, spacing varies)
-_SWAPIMAGE_RE = re.compile(
-    r"""swapImage\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]"""
-)
-
-utils_logger = get_logger("utils")
-
-# Short, well-known phrases used by CAPTCHA/challenge pages (Cloudflare,
-# reCAPTCHA, hCaptcha, generic "verify you're human" interstitials). This
-# is a heuristic, not a guarantee — it exists only to turn a silent
-# "0 images found" into an actionable log line when the site starts
-# blocking the scraper instead of serving real product pages.
-_BOT_PROTECTION_MARKERS = (
-    "captcha",
-    "checking your browser",
-    "verify you are human",
-    "verify you're human",
-    "attention required! | cloudflare",
-    "access denied",
-)
-
-
-def _looks_like_bot_protection(html):
+    Returns:
+        True if a known bot-protection marker phrase is found, else False.
+    """
     if not html:
         return False
     lowered = html.lower()
-    return any(marker in lowered for marker in _BOT_PROTECTION_MARKERS)
+    return any(marker in lowered for marker in BOT_PROTECTION_MARKERS)
 
 
-_KNOWN_TYPE_FOLDERS = {
-    "Packaging Image": "package_photos/package_",
-    "primary": "",
-    "Extra Image": "extra_photos/extra_",
-}
-
-
-def _folder_for_type(img_type):
+def _folder_for_type(img_type: str) -> Optional[str]:
     """
     Return the folder prefix for a known image type, or None for an
     unrecognized one. Returning None (instead of guessing "extra") means
     an unfamiliar type — e.g. a future "Gallery Image" or "360 Image" —
     gets logged and skipped by the caller rather than silently mapped to
     the wrong folder.
+
+    Args:
+        img_type: the image type string parsed from a swapImage() call
+            (e.g. "primary", "Extra Image", "Packaging Image").
+
+    Returns:
+        The CloudFront folder prefix for that type, or None if unknown.
     """
-    return _KNOWN_TYPE_FOLDERS.get(img_type)
+    return KNOWN_TYPE_FOLDERS.get(img_type)
 
 
-def _large_url_for(filename, img_type):
+def _large_url_for(filename: str, img_type: str) -> Optional[str]:
+    """
+    Build the full-resolution CloudFront URL for one thumbnail.
+
+    Args:
+        filename: image filename parsed from swapImage() (e.g. "wcp-fs23_extra08.jpg").
+        img_type: image type parsed from swapImage() (e.g. "Extra Image").
+
+    Returns:
+        The full-resolution image URL, or None if img_type is unrecognized.
+    """
     folder = _folder_for_type(img_type)
     if folder is None:
         return None
     return f"{CLOUDFRONT_BASE}files/Primary/{folder}large/{filename}"
 
 
-def parse_image_urls(soup, primary_only=False):
+def parse_image_urls(soup: Optional[BeautifulSoup], primary_only: bool = False) -> list[str]:
     """
     Return a deduped list of high-resolution image URLs found on a product
     page. Never raises.
 
-    If primary_only is True, every "Extra Image" and "Packaging Image"
-    thumbnail is skipped — only the single primary product photo is kept.
+    Args:
+        soup: parsed product page, or None.
+        primary_only: if True, skip every "Extra Image" and "Packaging
+            Image" thumbnail and keep only the single primary product photo.
+
+    Returns:
+        A list of full-resolution image URLs, in page order, with
+        duplicate (filename, type) pairs removed.
     """
     if soup is None:
         return []
@@ -222,20 +320,20 @@ def parse_image_urls(soup, primary_only=False):
         utils_logger.warning("Could not select thumbnails: %s", exc)
         return []
 
-    seen = set()
-    urls = []
+    seen: set[tuple[str, str]] = set()
+    urls: list[str] = []
     for thumb in thumbnails:
         onclick = thumb.get("onclick")
         if not onclick:
             continue  # placeholder / no-image thumb, skip
 
-        match = _SWAPIMAGE_RE.search(onclick)
+        match = SWAPIMAGE_RE.search(onclick)
         if not match:
             continue
         filename = match.group(1).strip()
         img_type = match.group(2).strip()
 
-        if primary_only and img_type != "primary":
+        if primary_only and img_type != IMAGE_TYPE_PRIMARY:
             continue
 
         key = (filename, img_type)
@@ -254,11 +352,33 @@ def parse_image_urls(soup, primary_only=False):
 
 
 # --------------------------------------------------------------------------
-# Writing the output CSV
+# Building and writing output rows
 # --------------------------------------------------------------------------
 
-def write_images_csv(rows, path):
-    """Write image rows to a CSV file, creating the output folder if needed."""
+def make_record(sku: str, url: str, image_url: str) -> dict[str, str]:
+    """
+    Build one output row dict. Centralizes the row shape so every place
+    that produces an output record (and OUTPUT_COLUMNS) agrees on it.
+
+    Args:
+        sku: product SKU.
+        url: product page URL.
+        image_url: full-resolution image URL.
+
+    Returns:
+        A dict with keys "sku", "url", "image_url".
+    """
+    return {"sku": sku, "url": url, "image_url": image_url}
+
+
+def write_images_csv(rows: Iterable[dict[str, str]], path: Path) -> None:
+    """
+    Write image rows to a CSV file, creating the output folder if needed.
+
+    Args:
+        rows: iterable of dicts shaped like make_record()'s output.
+        path: destination CSV path.
+    """
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -279,58 +399,34 @@ def write_images_csv(rows, path):
 # job is fetching + parsing the page.
 # ==========================================================================
 
-scraper_logger = get_logger("scraper")
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-REQUEST_TIMEOUT_SECONDS = 15
-MAX_RETRIES = 3
-INITIAL_BACKOFF_SECONDS = 2.0  # doubles each retry: 2s, 4s, 8s
-RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}  # transient — worth retrying; 404/403 are not
-
-# Pause between products so a run of thousands of pages doesn't hammer the
-# site back-to-back. Modest cost on total runtime, meaningfully reduces
-# the chance of tripping rate limiting in the first place.
-REQUEST_DELAY_SECONDS = 0.2
-
-# GET-check (stream=True, body never read) every constructed image URL
-# before trusting it, so a folder-naming change on the site shows up as a
-# logged warning instead of a silently broken link in the output. GET is
-# used instead of HEAD because some CDN configs don't support HEAD
-# reliably, while GET is universally supported.
-# GET-check (stream=True, body never read) every constructed image URL
-# before trusting it, so a folder-naming change on the site shows up as a
-# logged warning instead of a silently broken link in the output. GET is
-# used instead of HEAD because some CDN configs don't support HEAD
-# reliably, while GET is universally supported.
-#
-# Off by default: for a full run (thousands of products x ~8 images each)
-# this is tens of thousands of extra HTTP requests, which meaningfully
-# slows the run down. Turn it on with --validate when you want the safety
-# check — e.g. after the site changes something, or for a first run
-# against a catalog you haven't scraped before.
-DEFAULT_VALIDATE_IMAGES = False
-VALIDATE_TIMEOUT_SECONDS = 10
-
-
 class ProductScraper:
     """Fetches a product page and extracts its high-resolution image URLs."""
 
-    def __init__(self, validate=DEFAULT_VALIDATE_IMAGES, primary_only=False):
+    def __init__(self, validate: bool = DEFAULT_VALIDATE_IMAGES, primary_only: bool = False) -> None:
+        """
+        Args:
+            validate: if True, GET-check every constructed image URL
+                before trusting it (see VALIDATE_TIMEOUT_SECONDS).
+            primary_only: if True, only keep each product's primary photo.
+        """
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
         self.validate = validate
         self.primary_only = primary_only
 
-    def _retry_after_seconds(self, response):
+    def _retry_after_seconds(self, response: requests.Response) -> Optional[float]:
         """
         Parse a 429 response's Retry-After header, if present. Returns None
         if the header is missing or isn't a plain integer number of
         seconds (the HTTP-date form exists but is rare from CDNs/APIs and
         not worth the extra parsing here) — callers fall back to normal
         exponential backoff in that case.
+
+        Args:
+            response: the 429 response to inspect.
+
+        Returns:
+            Seconds to wait, or None if unavailable/unparseable.
         """
         value = response.headers.get("Retry-After")
         if not value:
@@ -340,8 +436,18 @@ class ProductScraper:
         except ValueError:
             return None
 
-    def fetch_page(self, url):
-        """Download a page's HTML, retrying transient errors with backoff. Never raises."""
+    def fetch_page(self, url: str) -> Optional[str]:
+        """
+        Download a page's HTML, retrying transient errors with backoff.
+        Never raises.
+
+        Args:
+            url: product page URL to fetch.
+
+        Returns:
+            The page's HTML text, or None if it could not be fetched
+            (404, bot protection, or retries exhausted).
+        """
         backoff = INITIAL_BACKOFF_SECONDS
 
         for attempt in range(1, MAX_RETRIES + 1):
@@ -396,8 +502,16 @@ class ProductScraper:
 
         return None
 
-    def parse_html(self, html):
-        """Parse raw HTML into a BeautifulSoup tree. Returns None on failure, never raises."""
+    def parse_html(self, html: Optional[str]) -> Optional[BeautifulSoup]:
+        """
+        Parse raw HTML into a BeautifulSoup tree. Never raises.
+
+        Args:
+            html: raw page HTML, or None.
+
+        Returns:
+            A BeautifulSoup tree, or None if html is empty or unparseable.
+        """
         if not html:
             return None
         try:
@@ -406,15 +520,22 @@ class ProductScraper:
             scraper_logger.error("Failed to parse HTML: %s", exc)
             return None
 
-    def _validate(self, image_url):
+    def _validate(self, image_url: str) -> tuple[bool, str]:
         """
-        Check one image URL. Returns (ok, reason).
+        Check that one image URL actually resolves.
 
         Uses GET with stream=True rather than HEAD: some CDNs/edge
         configs don't support HEAD reliably, while GET is universally
         supported. stream=True means we don't download the image body —
         we only read the status line/headers, then close the connection
         immediately, so this stays cheap.
+
+        Args:
+            image_url: the constructed full-resolution image URL to check.
+
+        Returns:
+            (True, "<status> OK") if the URL resolves successfully,
+            otherwise (False, "<reason>").
         """
         try:
             response = self.session.get(
@@ -427,8 +548,21 @@ class ProductScraper:
         except requests.exceptions.RequestException as exc:
             return False, str(exc)
 
-    def extract_images(self, soup, html, sku, url):
-        """Return every valid high-res image URL on the page. Never raises."""
+    def extract_images(self, soup: Optional[BeautifulSoup], html: Optional[str], sku: str, url: str) -> list[str]:
+        """
+        Return every valid high-res image URL on the page. Never raises.
+
+        Args:
+            soup: parsed product page, or None.
+            html: raw page HTML (used only to detect bot-protection pages
+                when no thumbnails are found).
+            sku: product SKU, for logging.
+            url: product page URL, for logging.
+
+        Returns:
+            A list of validated (if self.validate) or raw candidate
+            image URLs. Empty if none were found or none passed validation.
+        """
         candidate_urls = parse_image_urls(soup, primary_only=self.primary_only)
         if not candidate_urls:
             if _looks_like_bot_protection(html):
@@ -457,8 +591,18 @@ class ProductScraper:
 
         return valid_urls
 
-    def scrape(self, sku, url):
-        """Fetch + parse one product. Always returns {"sku", "url", "images": [...]}, never raises."""
+    def scrape(self, sku: str, url: str) -> dict[str, object]:
+        """
+        Fetch + parse one product. Never raises.
+
+        Args:
+            sku: product SKU.
+            url: product page URL.
+
+        Returns:
+            {"sku": sku, "url": url, "images": [...]} — "images" is empty
+            if the page could not be fetched, parsed, or had no images.
+        """
         scraper_logger.info("Scraping %s (%s)", sku, url)
 
         html = self.fetch_page(url)
@@ -476,27 +620,33 @@ class ProductScraper:
 # CLI entry point
 # ==========================================================================
 
-logger = get_logger("main")
+def _find_column(fieldnames: Optional[list[str]], candidates: tuple[str, ...]) -> Optional[str]:
+    """
+    Return the first candidate header name present in fieldnames, or None.
 
-INPUT_PATH = Path("data") / "data.csv"
-OUTPUT_PATH = Path("output") / "images.csv"
+    Args:
+        fieldnames: CSV header names as read by csv.DictReader, or None.
+        candidates: acceptable header names, in preference order.
 
-# The real data.csv uses different header names than a generic spec might,
-# so both are accepted here instead of hard-failing on a header mismatch.
-SKU_COLUMN_CANDIDATES = ("sku", "manu_sku")
-URL_COLUMN_CANDIDATES = ("url", "prod_page_url")
-
-
-def _find_column(fieldnames, candidates):
-    """Return the first candidate header name present in fieldnames, or None."""
+    Returns:
+        The first matching header name, or None if none match.
+    """
     for candidate in candidates:
         if candidate in (fieldnames or []):
             return candidate
     return None
 
 
-def read_input_rows(path):
-    """Read data.csv and yield {"sku", "url"} dicts, skipping rows missing either."""
+def read_input_rows(path: Path) -> Iterator[dict[str, str]]:
+    """
+    Read data.csv and yield {"sku", "url"} dicts, skipping rows missing either.
+
+    Args:
+        path: path to the input CSV.
+
+    Yields:
+        {"sku": str, "url": str} for each valid row.
+    """
     if not path.exists():
         logger.error("Input file not found: %s", path)
         return
@@ -519,15 +669,21 @@ def read_input_rows(path):
             yield {"sku": sku, "url": url}
 
 
-def dedupe_input_rows(input_rows):
+def dedupe_input_rows(input_rows: list[dict[str, str]]) -> list[dict[str, str]]:
     """
     Drop rows whose url has already been seen, keeping the first
     occurrence and preserving order. Dedup by url (not sku) because url
     is what actually gets fetched — if two rows point to the same page,
     scraping it twice only produces duplicate output rows.
+
+    Args:
+        input_rows: rows as produced by read_input_rows().
+
+    Returns:
+        The input rows with same-url duplicates removed, in original order.
     """
-    seen_urls = set()
-    unique_rows = []
+    seen_urls: set[str] = set()
+    unique_rows: list[dict[str, str]] = []
 
     for row in input_rows:
         if row["url"] in seen_urls:
@@ -542,8 +698,17 @@ def dedupe_input_rows(input_rows):
     return unique_rows
 
 
-def generate_image_rows(scraper, input_rows):
-    """Scrape every input row and yield one output dict per image found."""
+def generate_image_rows(scraper: ProductScraper, input_rows: list[dict[str, str]]) -> Iterator[dict[str, str]]:
+    """
+    Scrape every input row and yield one output dict per image found.
+
+    Args:
+        scraper: configured ProductScraper instance.
+        input_rows: rows as produced by read_input_rows()/dedupe_input_rows().
+
+    Yields:
+        Records shaped like make_record()'s output, one per image found.
+    """
     products_with_images = 0
     products_without_images = 0
 
@@ -564,7 +729,7 @@ def generate_image_rows(scraper, input_rows):
         else:
             products_with_images += 1
             for image_url in image_urls:
-                yield {"sku": sku, "url": url, "image_url": image_url}
+                yield make_record(sku, url, image_url)
 
         time.sleep(REQUEST_DELAY_SECONDS)
 
@@ -575,11 +740,26 @@ def generate_image_rows(scraper, input_rows):
     )
 
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="Scrape product images.")
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    """
+    Parse command-line arguments.
+
+    Args:
+        argv: argument list to parse, or None to use sys.argv.
+
+    Returns:
+        Parsed argparse.Namespace with "test", "validate", "primary_only".
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            f"Scrape product images listed in {INPUT_PATH} and write "
+            f"one row per image to {OUTPUT_PATH}."
+        ),
+    )
     parser.add_argument(
         "--test", "-n", type=int, default=None, metavar="N",
-        help="Only scrape the first N valid input rows (quick test run).",
+        help="Only scrape the first N valid input rows, for a quick test run "
+             "instead of the full catalog.",
     )
     parser.add_argument(
         "--validate", action="store_true",
@@ -598,10 +778,19 @@ def parse_args(argv=None):
             "normally every photo on the page is kept)."
         ),
     )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}",
+    )
     return parser.parse_args(argv)
 
 
-def main():
+def main() -> int:
+    """
+    Run the full scrape: read input, dedupe, scrape every product, write output.
+
+    Returns:
+        0 on success, 1 if there was nothing valid to scrape.
+    """
     args = parse_args()
     logger.info("Starting scrape: %s -> %s", INPUT_PATH, OUTPUT_PATH)
 
@@ -628,4 +817,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
