@@ -16,10 +16,11 @@ present in the raw page HTML, so `requests` + `BeautifulSoup` is enough.
 ## Run
 
 ```bash
-python main.py                    # full run, no per-image validation (fast)
-python main.py --test 20          # quick test on the first 20 valid rows
-python main.py --validate         # safety check: GET-verify every image URL before saving
-python main.py --test 20 --validate   # flags combine freely
+python main.py                        # full run, every image kept
+python main.py --test 20              # quick test on the first 20 valid rows
+python main.py --validate             # safety check: GET-verify every image URL before saving
+python main.py --primary-only         # keep only each product's main photo, skip extras/packaging
+python main.py --test 20 --validate --primary-only   # flags combine freely
 ```
 
 - Input:  `data/data.csv` — accepts either `sku`/`url` or `manu_sku`/`prod_page_url`
@@ -59,6 +60,13 @@ and rebuilds the URL the same way, instead of clicking every thumbnail.
   and `Extra Image` map to known folders; anything else (e.g. a future
   `Gallery Image` or `360 Image` type) is logged as a `WARNING` and
   skipped, rather than guessed as an "extra" image.
+- By default **every** photo on the page is kept — primary, extras, and
+  packaging shots. Pass `--primary-only` to keep just the single primary
+  photo per product and drop every `Extra Image`/`Packaging Image`
+  thumbnail. Note: most products have more than one real, distinct photo
+  (different angles, in-use shots, packaging) — these are not duplicates
+  of the primary image, so `--primary-only` is a deliberate reduction in
+  what gets saved, not a dedup fix.
 - Every constructed URL can optionally be checked with a `GET(stream=True)`
   request before being trusted — the body is never downloaded, only the
   status is read. This is **off by default** (a full run has thousands of

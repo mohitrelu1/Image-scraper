@@ -186,25 +186,15 @@ _KNOWN_TYPE_FOLDERS = {
     "Extra Image": "extra_photos/extra_",
 }
 
-# Image types the output should actually include. "Extra Image" thumbnails
-# (additional angles/lifestyle shots) are recognized — we know how to build
-# their URL — but deliberately left out here. To bring them back later
-# (e.g. the client wants full image coverage), just add "Extra Image" to
-# this set; no other code changes needed.
-INCLUDED_TYPES = {"primary", "Packaging Image"}
-
 
 def _folder_for_type(img_type):
     """
-    Return the folder prefix for a known, wanted image type (one that's
-    both in _KNOWN_TYPE_FOLDERS and in INCLUDED_TYPES). Returns None
-    otherwise — the caller distinguishes "recognized but not wanted"
-    (skip quietly) from "genuinely unrecognized" (log a warning, since a
-    future type like "Gallery Image" shouldn't map to the wrong folder
-    silently).
+    Return the folder prefix for a known image type, or None for an
+    unrecognized one. Returning None (instead of guessing "extra") means
+    an unfamiliar type — e.g. a future "Gallery Image" or "360 Image" —
+    gets logged and skipped by the caller rather than silently mapped to
+    the wrong folder.
     """
-    if img_type not in INCLUDED_TYPES:
-        return None
     return _KNOWN_TYPE_FOLDERS.get(img_type)
 
 
@@ -215,10 +205,13 @@ def _large_url_for(filename, img_type):
     return f"{CLOUDFRONT_BASE}files/Primary/{folder}large/{filename}"
 
 
-def parse_image_urls(soup):
+def parse_image_urls(soup, primary_only=False):
     """
     Return a deduped list of high-resolution image URLs found on a product
     page. Never raises.
+
+    If primary_only is True, every "Extra Image" and "Packaging Image"
+    thumbnail is skipped — only the single primary product photo is kept.
     """
     if soup is None:
         return []
@@ -242,6 +235,9 @@ def parse_image_urls(soup):
         filename = match.group(1).strip()
         img_type = match.group(2).strip()
 
+        if primary_only and img_type != "primary":
+            continue
+
         key = (filename, img_type)
         if key in seen:
             continue  # duplicate carousel copy
@@ -249,8 +245,7 @@ def parse_image_urls(soup):
 
         image_url = _large_url_for(filename, img_type)
         if image_url is None:
-            if img_type not in _KNOWN_TYPE_FOLDERS:
-                utils_logger.warning("Unknown image type %r for %r, skipping", img_type, filename)
+            utils_logger.warning("Unknown image type %r for %r, skipping", img_type, filename)
             continue
 
         urls.append(image_url)
@@ -305,6 +300,11 @@ REQUEST_DELAY_SECONDS = 0.2
 # logged warning instead of a silently broken link in the output. GET is
 # used instead of HEAD because some CDN configs don't support HEAD
 # reliably, while GET is universally supported.
+# GET-check (stream=True, body never read) every constructed image URL
+# before trusting it, so a folder-naming change on the site shows up as a
+# logged warning instead of a silently broken link in the output. GET is
+# used instead of HEAD because some CDN configs don't support HEAD
+# reliably, while GET is universally supported.
 #
 # Off by default: for a full run (thousands of products x ~8 images each)
 # this is tens of thousands of extra HTTP requests, which meaningfully
@@ -318,10 +318,11 @@ VALIDATE_TIMEOUT_SECONDS = 10
 class ProductScraper:
     """Fetches a product page and extracts its high-resolution image URLs."""
 
-    def __init__(self, validate=DEFAULT_VALIDATE_IMAGES):
+    def __init__(self, validate=DEFAULT_VALIDATE_IMAGES, primary_only=False):
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
         self.validate = validate
+        self.primary_only = primary_only
 
     def _retry_after_seconds(self, response):
         """
@@ -428,7 +429,7 @@ class ProductScraper:
 
     def extract_images(self, soup, html, sku, url):
         """Return every valid high-res image URL on the page. Never raises."""
-        candidate_urls = parse_image_urls(soup)
+        candidate_urls = parse_image_urls(soup, primary_only=self.primary_only)
         if not candidate_urls:
             if _looks_like_bot_protection(html):
                 scraper_logger.warning(
@@ -589,6 +590,14 @@ def parse_args(argv=None):
             "check, e.g. after the site changes or on a first run)."
         ),
     )
+    parser.add_argument(
+        "--primary-only", action="store_true",
+        help=(
+            "Only keep each product's primary photo; skip all Extra Image "
+            "and Packaging Image thumbnails entirely (off by default — "
+            "normally every photo on the page is kept)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -608,8 +617,9 @@ def main():
         input_rows = input_rows[: args.test]
 
     logger.info("Image validation: %s", "ON" if args.validate else "OFF")
+    logger.info("Primary-only mode: %s", "ON (extras/packaging skipped)" if args.primary_only else "OFF (all images kept)")
 
-    scraper = ProductScraper(validate=args.validate)
+    scraper = ProductScraper(validate=args.validate, primary_only=args.primary_only)
     image_rows = generate_image_rows(scraper, input_rows)
     write_images_csv(image_rows, OUTPUT_PATH)
 
