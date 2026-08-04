@@ -21,17 +21,24 @@ Run it with:
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
 import logging
+import os
 import re
 import sys
 import time
+import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 import requests
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from posthog import Posthog
+
+load_dotenv()
 
 __version__ = "1.1.0"
 
@@ -119,6 +126,8 @@ REQUEST_DELAY_SECONDS = 0.2
 DEFAULT_VALIDATE_IMAGES = False
 VALIDATE_TIMEOUT_SECONDS = 10
 
+# --- PostHog ----------------------------------------------------------------
+POSTHOG_ID_FILE = Path.home() / ".image_scraper_posthog_id"
 
 # ==========================================================================
 # Logging setup
@@ -167,6 +176,57 @@ def get_logger(name: str) -> logging.Logger:
 utils_logger = get_logger("utils")
 scraper_logger = get_logger("scraper")
 logger = get_logger("main")
+
+
+# ==========================================================================
+# PostHog analytics
+# ==========================================================================
+
+_posthog_client: Optional[Posthog] = None
+
+
+def _get_machine_id() -> str:
+    if POSTHOG_ID_FILE.exists():
+        stored = POSTHOG_ID_FILE.read_text().strip()
+        if stored:
+            return stored
+    machine_id = f"machine_{uuid.uuid4().hex}"
+    try:
+        POSTHOG_ID_FILE.write_text(machine_id)
+    except OSError:
+        pass
+    return machine_id
+
+
+def _initialize_posthog() -> Optional[Posthog]:
+    global _posthog_client
+    project_token = os.getenv("POSTHOG_PROJECT_TOKEN")
+    if not project_token:
+        print(
+            "WARNING: POSTHOG_PROJECT_TOKEN variable required by PostHog is missing or "
+            "un-configured, this causes events to be silently missed. "
+            "This error stops appearing once POSTHOG_PROJECT_TOKEN is configured",
+            file=sys.stderr,
+        )
+        return None
+    _posthog_client = Posthog(
+        project_token,
+        host=os.getenv("POSTHOG_HOST", "https://eu.i.posthog.com"),
+        debug=os.getenv("POSTHOG_DEBUG", "false").lower() == "true",
+        enable_exception_autocapture=True,
+    )
+    atexit.register(_posthog_client.shutdown)
+    return _posthog_client
+
+
+def _track(event: str, properties: Optional[dict] = None) -> None:
+    if _posthog_client is None:
+        return
+    _posthog_client.capture(
+        distinct_id=_get_machine_id(),
+        event=event,
+        properties=properties or {},
+    )
 
 
 # ==========================================================================
@@ -348,6 +408,7 @@ class ProductScraper:
                     )
                     if attempt == MAX_RETRIES:
                         scraper_logger.error("Giving up on %s after %d attempts", url, MAX_RETRIES)
+                        _track("page_fetch_failed", {"status_code": response.status_code, "max_retries": MAX_RETRIES})
                         return None
                     time.sleep(wait_seconds)
                     backoff *= 2
@@ -369,6 +430,7 @@ class ProductScraper:
 
             if attempt == MAX_RETRIES:
                 scraper_logger.error("Giving up on %s after %d attempts", url, MAX_RETRIES)
+                _track("page_fetch_failed", {"status_code": None, "max_retries": MAX_RETRIES})
                 return None
             time.sleep(backoff)
             backoff *= 2
@@ -410,6 +472,7 @@ class ProductScraper:
                     "and the page body matches a CAPTCHA/challenge pattern) | sku=%s | url=%s",
                     sku, url,
                 )
+                _track("bot_protection_detected", {})
             else:
                 scraper_logger.warning("No images found for sku=%s url=%s", sku, url)
             return []
@@ -516,6 +579,11 @@ def generate_image_rows(scraper: ProductScraper, input_rows: list[dict[str, str]
             for image_url in image_urls:
                 yield make_record(sku, url, image_url)
 
+        _track("product_scraped", {
+            "images_found": len(image_urls),
+            "has_images": len(image_urls) > 0,
+        })
+
         time.sleep(REQUEST_DELAY_SECONDS)
 
     logger.info(
@@ -562,12 +630,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    _initialize_posthog()
+
     mode = "primary image only" if args.primary_only else "all images (primary + extras + packaging)"
     logger.info("Starting scrape (%s): %s -> %s", mode, INPUT_PATH, OUTPUT_PATH)
 
     input_rows = list(read_input_rows(INPUT_PATH))
     if not input_rows:
         logger.error("No valid input rows found in %s; nothing to scrape.", INPUT_PATH)
+        _track("scrape_run_failed", {"reason": "no_input_rows"})
         return 1
 
     input_rows = dedupe_input_rows(input_rows)
@@ -579,9 +650,31 @@ def main() -> int:
     logger.info("Image validation: %s", "ON" if args.validate else "OFF")
     logger.info("Primary-only mode: %s", "ON" if args.primary_only else "OFF")
 
-    scraper = ProductScraper(validate=args.validate, primary_only=args.primary_only)
-    image_rows = generate_image_rows(scraper, input_rows)
-    write_images_csv(image_rows, OUTPUT_PATH)
+    _track("scrape_run_started", {
+        "primary_only_mode": args.primary_only,
+        "validate_images": args.validate,
+        "test_mode": args.test is not None,
+        "test_limit": args.test,
+        "input_row_count": len(input_rows),
+    })
+
+    run_start = time.time()
+    try:
+        scraper = ProductScraper(validate=args.validate, primary_only=args.primary_only)
+        image_rows = list(generate_image_rows(scraper, input_rows))
+        write_images_csv(iter(image_rows), OUTPUT_PATH)
+    except Exception as exc:
+        logger.error("Unexpected error during scrape run: %s", exc)
+        _track("scrape_run_failed", {"error_type": type(exc).__name__})
+        if _posthog_client:
+            _posthog_client.capture_exception(exc, distinct_id=_get_machine_id())
+        return 1
+
+    _track("scrape_run_completed", {
+        "total_products": len(input_rows),
+        "total_image_rows": len(image_rows),
+        "duration_seconds": round(time.time() - run_start, 2),
+    })
 
     logger.info("Done. Output written to %s", OUTPUT_PATH)
     return 0

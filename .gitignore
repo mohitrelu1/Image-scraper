@@ -15,3 +15,4 @@ data/
 # macOS / Windows
 .DS_Store
 Thumbs.db
+.env
